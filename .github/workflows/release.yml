@@ -1,0 +1,31 @@
+name: Build Plugin Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Package plugin with correct folder structure
+        run: |
+          mkdir -p build/qwoo-core
+          rsync -av \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='build' \
+            --exclude='.gitignore' \
+            ./ build/qwoo-core/
+          cd build
+          zip -r ../qwoo-core.zip qwoo-core
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: qwoo-core.zip
+          generate_release_notes: true
