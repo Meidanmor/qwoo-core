@@ -72,6 +72,7 @@ class Qwoo_Technical_Settings {
         add_action( 'wp_ajax_qwoo_regenerate_proxy_secret',   [ $this, 'ajax_regenerate_proxy_secret' ] );
         add_action( 'wp_ajax_qwoo_sync_data',                 [ $this, 'ajax_sync_data' ] );
         add_action( 'wp_ajax_qwoo_install_stripe_gateway',    [ $this, 'ajax_install_stripe_gateway' ] );
+        add_action( 'wp_ajax_qwoo_generate_vapid_keys', [ $this, 'ajax_generate_vapid_keys' ] );
         add_action( 'rest_api_init', [ $this, 'setup_cors_headers' ], 15 );
 
         // Layer 1 (see class docblock): the actual access-control gate.
