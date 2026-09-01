@@ -3,9 +3,9 @@
 add_action('rest_api_init', function () {
 
     register_rest_route('qwoo/v1', '/export-products', [
-            'methods'  => 'GET',
-            'callback' => 'qwoo_export_products_json',
-            'permission_callback' => '__return_true'
+        'methods'  => 'GET',
+        'callback' => 'qwoo_export_products_json',
+        'permission_callback' => '__return_true'
     ]);
 
 });
@@ -26,7 +26,7 @@ function qwoo_export_products_json(WP_REST_Request $request)
 
     // fallback: return raw string if generator already outputs JSON text
     return new WP_REST_Response($json, 200, [
-            'Content-Type' => 'application/json'
+        'Content-Type' => 'application/json'
     ]);
 }
 
@@ -47,181 +47,192 @@ if (!wp_next_scheduled('auto_sync_products_to_github')) {
 }
 
 /**
- * Main function: fetch products → generate JSON → push to GitHub if changed.
+ * Normalize a JSON string to a canonical pretty-printed form, so two
+ * semantically-identical payloads (different key order, whitespace, etc.)
+ * hash and compare as equal.
  */
-/**
- * Atomically sync the hero image + home.json to GitHub in ONE commit.
- *
- * Safety: this function only ever reads/deletes tree entries whose path
- * starts with $image_folder. It never inspects or modifies any other
- * part of the repository tree.
- *
- * @param int    $attachment_id   WP attachment ID of the hero image
- * @param array  $home_data       The 'home' settings array (without hero_image_id)
- * @param string $image_folder    e.g. 'public/homepage-hero'
- * @param string $json_path       e.g. 'public/config/home.json'
- * @return bool
- */
-function aps_sync_hero_image_to_github( $attachment_id, $home_data, $image_folder = 'public/homepage-hero', $json_path = 'public/config/home.json' ) {
+function aps_normalize_json( $json ) {
+    $decoded = json_decode( $json, true );
+    return $decoded ? json_encode( $decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) : $json;
+}
 
+/**
+ * ────────────────────────────────────────────────────────────────
+ * Batched GitHub commits
+ * ────────────────────────────────────────────────────────────────
+ * Lets several files (JSON configs, images, etc.) be written to the repo
+ * in ONE commit instead of one commit per file. Usage:
+ *
+ *   $batch = aps_github_start_batch();
+ *   if ( ! $batch ) { ... not configured / repo unreachable ... }
+ *
+ *   aps_github_batch_put_file( $batch, 'public/data/products.json', $json1 );
+ *   aps_github_batch_put_file( $batch, 'public/data/categories.json', $json2 );
+ *
+ *   $result = aps_github_finish_batch( $batch, 'Update products + categories' );
+ *   // $result: true (committed), 'no_changes' (nothing differed), or false (API error)
+ *
+ * aps_github_start_batch() does ONE read of the branch ref/commit/tree.
+ * aps_github_batch_put_file() only creates a blob (and stages a tree entry)
+ * when the content actually differs from what's already in the repo —
+ * unchanged files are skipped and never touch the commit. Nothing is
+ * written to GitHub until aps_github_finish_batch() creates the tree,
+ * commit, and moves the branch ref — all in a single round trip each.
+ */
+function aps_github_start_batch() {
     $owner  = Qwoo_Technical_Settings::get_key('GITHUB_REPO_OWNER');
     $repo   = Qwoo_Technical_Settings::get_key('GITHUB_REPO_NAME');
     $token  = Qwoo_Technical_Settings::get_key('GITHUB_TOKEN');
     $branch = Qwoo_Technical_Settings::get_key('GITHUB_BRANCH') ?: 'main';
 
-    if ( empty($owner) || empty($repo) || empty($token) ) {
+    if ( empty( $owner ) || empty( $repo ) || empty( $token ) ) {
         return false;
     }
 
-    $attachment_path = get_attached_file( $attachment_id );
-    if ( ! $attachment_path || ! file_exists( $attachment_path ) ) {
-        return false;
-    }
-
-    $image_folder = trim( $image_folder, '/' );
-
-    // Keep the ORIGINAL filename from the backend, just sanitized for safety
-    // (no path traversal, no weird characters) — no more hero-{ID} renaming.
-    $original_filename = sanitize_file_name( basename( $attachment_path ) );
-    $new_image_path    = "{$image_folder}/{$original_filename}";
-
-    // The value written into home.json — the real backend URL, used by the
-    // frontend as: try local /{basename} first, fall back to this URL if
-    // the local file isn't there yet (e.g. deploy still in progress).
-    $backend_image_url = wp_get_attachment_url( $attachment_id );
-
-    // Read the image once and compute its Git blob sha locally, so we can
-    // compare against the tree without ever re-downloading the file from GitHub.
-    $image_data = file_get_contents( $attachment_path );
-    if ( $image_data === false ) return false;
-    $local_image_sha = sha1( "blob " . strlen( $image_data ) . "\0" . $image_data );
-
-    $github_api = function( $method, $endpoint, $body = null ) use ( $owner, $repo, $token ) {
+    $api = function( $method, $endpoint, $body = null ) use ( $owner, $repo, $token ) {
         $args = [
-                'method'  => $method,
-                'headers' => [
-                        'Authorization' => "token {$token}",
-                        'User-Agent'    => 'WordPress-GitHub-Client',
-                        'Content-Type'  => 'application/json',
-                        'Accept'        => 'application/vnd.github+json',
-                ],
-                'timeout' => 30,
+            'method'  => $method,
+            'headers' => [
+                'Authorization' => "token {$token}",
+                'User-Agent'    => 'WordPress-GitHub-Client',
+                'Content-Type'  => 'application/json',
+                'Accept'        => 'application/vnd.github+json',
+            ],
+            'timeout' => 30,
         ];
         if ( $body !== null ) {
             $args['body'] = json_encode( $body );
         }
 
-        $url = "https://api.github.com/repos/{$owner}/{$repo}{$endpoint}";
+        $url      = "https://api.github.com/repos/{$owner}/{$repo}{$endpoint}";
         $response = wp_remote_request( $url, $args );
 
         if ( is_wp_error( $response ) ) {
+            error_log( 'APS Batch Sync Error: ' . $response->get_error_message() );
             return false;
         }
 
-        $code = wp_remote_retrieve_response_code( $response );
-        $raw  = wp_remote_retrieve_body( $response );
-        $decoded = json_decode( $raw, true );
+        $code    = wp_remote_retrieve_response_code( $response );
+        $decoded = json_decode( wp_remote_retrieve_body( $response ), true );
 
         if ( $code < 200 || $code >= 300 ) {
+            error_log( "APS Batch Sync Failed. Status: {$code}. Endpoint: {$endpoint}." );
             return false;
         }
 
         return $decoded;
     };
 
-    // 1. Latest commit on branch
-    $ref = $github_api( 'GET', "/git/ref/heads/{$branch}" );
+    $ref = $api( 'GET', "/git/ref/heads/{$branch}" );
     if ( ! $ref ) return false;
     $base_commit_sha = $ref['object']['sha'];
 
-    $commit = $github_api( 'GET', "/git/commits/{$base_commit_sha}" );
+    $commit = $api( 'GET', "/git/commits/{$base_commit_sha}" );
     if ( ! $commit ) return false;
     $base_tree_sha = $commit['tree']['sha'];
 
-    // 2. Full recursive tree — read-only, used to find stale image files AND
-    // to grab the current home.json blob sha (so we can diff it with zero extra requests).
-    $tree = $github_api( 'GET', "/git/trees/{$base_tree_sha}?recursive=1" );
+    $tree = $api( 'GET', "/git/trees/{$base_tree_sha}?recursive=1" );
     if ( ! $tree || empty( $tree['tree'] ) ) return false;
 
-    // 3. SAFETY-SCOPED: only collect blob paths inside $image_folder.
-    // Anything in that folder that ISN'T the new file is stale and gets deleted.
-    $stale_files = [];
-    $image_already_current = false;
-    $existing_json_sha = null;
-
+    $existing = [];
     foreach ( $tree['tree'] as $entry ) {
-        if ( $entry['type'] !== 'blob' ) continue;
-
-        if ( $entry['path'] === $json_path ) {
-            $existing_json_sha = $entry['sha'];
-            continue;
-        }
-
-        if ( strpos( $entry['path'], $image_folder . '/' ) !== 0 ) continue;
-
-        if ( $entry['path'] === $new_image_path && $entry['sha'] === $local_image_sha ) {
-            $image_already_current = true;
-        } else {
-            $stale_files[] = $entry['path'];
+        if ( $entry['type'] === 'blob' ) {
+            $existing[ $entry['path'] ] = $entry['sha'];
         }
     }
 
-    $tree_updates = [];
+    return [
+        'api'             => $api,
+        'branch'          => $branch,
+        'base_commit_sha' => $base_commit_sha,
+        'base_tree_sha'   => $base_tree_sha,
+        'existing'        => $existing,
+        'tree_updates'    => [],
+        'updated'         => [],
+        'skipped'         => [],
+        'deleted'         => [],
+        'failed'          => [],
+    ];
+}
 
-    foreach ( $stale_files as $old_path ) {
-        $tree_updates[] = [ 'path' => $old_path, 'mode' => '100644', 'type' => 'blob', 'sha' => null ];
+/**
+ * Stage a file write in an in-progress batch. Skips (no-op, no API call)
+ * when $content is byte-identical to what's already in the repo at $path.
+ *
+ * @param array  &$batch   Batch state from aps_github_start_batch()
+ * @param string $path     Repo-relative path, e.g. 'public/data/products.json'
+ * @param string $content  Raw file bytes (already normalized if it's JSON)
+ * @return bool  true if staged or skipped as unchanged, false on API error
+ */
+function aps_github_batch_put_file( &$batch, $path, $content ) {
+    $local_sha = sha1( "blob " . strlen( $content ) . "\0" . $content );
+
+    if ( isset( $batch['existing'][ $path ] ) && $batch['existing'][ $path ] === $local_sha ) {
+        $batch['skipped'][] = $path;
+        return true;
     }
 
-    if ( ! $image_already_current ) {
-        $image_blob = $github_api( 'POST', '/git/blobs', [
-                'content'  => base64_encode( $image_data ),
-                'encoding' => 'base64',
-        ] );
-        if ( ! $image_blob ) return false;
+    $blob = ( $batch['api'] )( 'POST', '/git/blobs', [
+        'content'  => base64_encode( $content ),
+        'encoding' => 'base64',
+    ] );
 
-        $tree_updates[] = [ 'path' => $new_image_path, 'mode' => '100644', 'type' => 'blob', 'sha' => $image_blob['sha'] ];
+    if ( ! $blob ) {
+        $batch['failed'][] = $path;
+        return false;
     }
 
-    // 4. JSON — key renamed to hero_image, value is the backend URL (not a local path)
-    $home_data['hero_image'] = $backend_image_url;
-    $json_content = json_encode( $home_data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES );
+    $batch['tree_updates'][] = [ 'path' => $path, 'mode' => '100644', 'type' => 'blob', 'sha' => $blob['sha'] ];
+    $batch['updated'][]      = $path;
+    return true;
+}
 
-    // Compare the local content hash against the sha already captured from the tree scan —
-    // no extra GET request needed, and no chance of hitting the Contents API's 1MB inline limit.
-    $local_json_sha = sha1( "blob " . strlen( $json_content ) . "\0" . $json_content );
-    $json_changed   = ( $existing_json_sha !== $local_json_sha );
+/**
+ * Stage removal of every existing blob whose path starts with $prefix,
+ * except $keep_path. Pass a folder (e.g. 'public/homepage-hero/') to clean
+ * up an entire folder, or a specific target path (e.g. the exact file about
+ * to be written) to scope cleanup narrowly — the latter matters when a
+ * folder is shared between two independent fields (like branding's logo
+ * and app icon) so cleaning up one never deletes the other.
+ */
+function aps_github_batch_delete_stale_prefix( &$batch, $prefix, $keep_path ) {
+    foreach ( $batch['existing'] as $path => $sha ) {
+        if ( strpos( $path, $prefix ) !== 0 ) continue;
+        if ( $path === $keep_path ) continue;
 
-    if ( $json_changed ) {
-        $json_blob = $github_api( 'POST', '/git/blobs', [
-                'content'  => base64_encode( $json_content ),
-                'encoding' => 'base64',
-        ] );
-        if ( ! $json_blob ) return false;
-
-        $tree_updates[] = [ 'path' => $json_path, 'mode' => '100644', 'type' => 'blob', 'sha' => $json_blob['sha'] ];
+        $batch['tree_updates'][] = [ 'path' => $path, 'mode' => '100644', 'type' => 'blob', 'sha' => null ];
+        $batch['deleted'][] = $path;
     }
+}
 
-    if ( empty( $tree_updates ) ) {
+/**
+ * Commit everything staged in the batch in ONE commit + ONE ref update.
+ * Returns true (committed), 'no_changes' (nothing was staged), or false
+ * (a GitHub API call failed).
+ */
+function aps_github_finish_batch( $batch, $message ) {
+    if ( empty( $batch['tree_updates'] ) ) {
         return 'no_changes';
     }
 
-    // 5. New tree, commit, move ref — unchanged
-    $new_tree = $github_api( 'POST', '/git/trees', [
-            'base_tree' => $base_tree_sha,
-            'tree'      => $tree_updates,
+    $api = $batch['api'];
+
+    $new_tree = $api( 'POST', '/git/trees', [
+        'base_tree' => $batch['base_tree_sha'],
+        'tree'      => $batch['tree_updates'],
     ] );
     if ( ! $new_tree ) return false;
 
-    $new_commit = $github_api( 'POST', '/git/commits', [
-            'message' => 'Update hero image and home config',
-            'tree'    => $new_tree['sha'],
-            'parents' => [ $base_commit_sha ],
+    $new_commit = $api( 'POST', '/git/commits', [
+        'message' => $message,
+        'tree'    => $new_tree['sha'],
+        'parents' => [ $batch['base_commit_sha'] ],
     ] );
     if ( ! $new_commit ) return false;
 
-    $updated_ref = $github_api( 'PATCH', "/git/refs/heads/{$branch}", [
-            'sha'   => $new_commit['sha'],
-            'force' => false,
+    $updated_ref = $api( 'PATCH', "/git/refs/heads/{$batch['branch']}", [
+        'sha'   => $new_commit['sha'],
+        'force' => false,
     ] );
     if ( ! $updated_ref ) return false;
 
@@ -229,184 +240,78 @@ function aps_sync_hero_image_to_github( $attachment_id, $home_data, $image_folde
 }
 
 /**
- * Atomically sync a single branding image (logo OR app icon) + its owning
- * JSON page to GitHub in ONE commit. Generalized from
- * aps_sync_hero_image_to_github() — same scoped-safety pattern (only ever
- * reads/deletes tree entries under $image_folder), but takes an explicit
- * $image_url_field so it can be reused for any single-image field instead
- * of being hardcoded to `hero_image`.
+ * Regenerates products.json, categories.json, and price-meta.json and
+ * pushes ALL of them to GitHub in a SINGLE commit — only files that
+ * actually changed are included, and if none changed, nothing is
+ * committed at all. Used by the "Sync Data Now" button.
  *
- * NOTE: when syncing branding with two images (logo_id + app_icon_id), call
- * this once per image field — each call is its own atomic commit against the
- * branch tip, so the second call will simply rebase on top of the first.
- *
- * @param int    $attachment_id   WP attachment ID of the image being synced
- * @param array  $page_data       The full settings array for this page (e.g. 'branding')
- * @param string $image_url_field The JSON key to write the resolved URL to, e.g. 'logo' or 'app_icon'
- * @param string $image_folder    e.g. 'public/branding'
- * @param string $json_path       e.g. 'public/config/branding.json'
- * @return bool|string true on success, 'no_changes' if nothing changed, false on failure.
+ * @return array {
+ *     @type bool     $ok          Whether the operation completed without error.
+ *     @type string[] $updated     Labels ('products'/'categories'/'price-meta') that were committed.
+ *     @type string[] $skipped     Labels that were identical to GitHub already.
+ *     @type string[] $failed      Labels that failed (local generation or API error).
+ *     @type bool     $no_changes  True if nothing needed to be committed.
+ *     @type string   $error       Set when $ok is false.
+ * }
  */
-function aps_sync_logo_to_github( $attachment_id, &$page_data, $image_url_field, $image_folder = 'public/branding', $json_path = 'public/config/branding.json' ) {
+function aps_sync_all_data_to_github() {
+    $generators = [
+        'products'   => [ 'aps_generate_products_json',   'public/data/products.json' ],
+        'categories' => [ 'aps_generate_categories_json', 'public/data/categories.json' ],
+        'price-meta' => [ 'aps_generate_price_meta_json', 'public/data/price-meta.json' ],
+    ];
 
-    $owner  = Qwoo_Technical_Settings::get_key('GITHUB_REPO_OWNER');
-    $repo   = Qwoo_Technical_Settings::get_key('GITHUB_REPO_NAME');
-    $token  = Qwoo_Technical_Settings::get_key('GITHUB_TOKEN');
-    $branch = Qwoo_Technical_Settings::get_key('GITHUB_BRANCH') ?: 'main';
+    $to_write = [];
+    $generation_failed = [];
 
-    if ( empty($owner) || empty($repo) || empty($token) ) {
-        return false;
-    }
+    foreach ( $generators as $label => $def ) {
+        [ $fn, $path ] = $def;
+        $json = call_user_func( $fn );
 
-    $attachment_path = get_attached_file( $attachment_id );
-    if ( ! $attachment_path || ! file_exists( $attachment_path ) ) {
-        return false;
-    }
-
-    $image_folder = trim( $image_folder, '/' );
-
-    // Keep the original filename (sanitized), namespaced by field so the
-    // logo and app icon don't collide if they happen to share a filename.
-    $original_filename = sanitize_file_name( basename( $attachment_path ) );
-    $new_image_path     = "{$image_folder}/{$original_filename}";
-
-    $backend_image_url = wp_get_attachment_url( $attachment_id );
-
-    $image_data = file_get_contents( $attachment_path );
-    if ( $image_data === false ) return false;
-    $local_image_sha = sha1( "blob " . strlen( $image_data ) . "\0" . $image_data );
-
-    $github_api = function( $method, $endpoint, $body = null ) use ( $owner, $repo, $token ) {
-        $args = [
-                'method'  => $method,
-                'headers' => [
-                        'Authorization' => "token {$token}",
-                        'User-Agent'    => 'WordPress-GitHub-Client',
-                        'Content-Type'  => 'application/json',
-                        'Accept'        => 'application/vnd.github+json',
-                ],
-                'timeout' => 30,
-        ];
-        if ( $body !== null ) {
-            $args['body'] = json_encode( $body );
-        }
-
-        $url = "https://api.github.com/repos/{$owner}/{$repo}{$endpoint}";
-        $response = wp_remote_request( $url, $args );
-
-        if ( is_wp_error( $response ) ) {
-            return false;
-        }
-
-        $code = wp_remote_retrieve_response_code( $response );
-        $raw  = wp_remote_retrieve_body( $response );
-        $decoded = json_decode( $raw, true );
-
-        if ( $code < 200 || $code >= 300 ) {
-            return false;
-        }
-
-        return $decoded;
-    };
-
-    // 1. Latest commit on branch
-    $ref = $github_api( 'GET', "/git/ref/heads/{$branch}" );
-    if ( ! $ref ) return false;
-    $base_commit_sha = $ref['object']['sha'];
-
-    $commit = $github_api( 'GET', "/git/commits/{$base_commit_sha}" );
-    if ( ! $commit ) return false;
-    $base_tree_sha = $commit['tree']['sha'];
-
-    // 2. Full recursive tree — read-only.
-    $tree = $github_api( 'GET', "/git/trees/{$base_tree_sha}?recursive=1" );
-    if ( ! $tree || empty( $tree['tree'] ) ) return false;
-
-    // 3. SAFETY-SCOPED: only ever touch blobs whose path starts with
-    // "{$image_folder}/{$image_url_field}-" — this keeps the logo sync from
-    // ever deleting the app-icon file (or vice versa) even though they share
-    // the same $image_folder.
-    $field_prefix = $new_image_path;
-    $stale_files = [];
-    $image_already_current = false;
-    $existing_json_sha = null;
-
-    foreach ( $tree['tree'] as $entry ) {
-        if ( $entry['type'] !== 'blob' ) continue;
-
-        if ( $entry['path'] === $json_path ) {
-            $existing_json_sha = $entry['sha'];
+        if ( ! $json ) {
+            $generation_failed[] = $label;
             continue;
         }
 
-        if ( strpos( $entry['path'], $field_prefix ) !== 0 ) continue;
-
-        if ( $entry['path'] === $new_image_path && $entry['sha'] === $local_image_sha ) {
-            $image_already_current = true;
-        } else {
-            $stale_files[] = $entry['path'];
-        }
+        $to_write[ $label ] = [ 'path' => $path, 'content' => aps_normalize_json( $json ) ];
     }
 
-    $tree_updates = [];
-
-    foreach ( $stale_files as $old_path ) {
-        $tree_updates[] = [ 'path' => $old_path, 'mode' => '100644', 'type' => 'blob', 'sha' => null ];
+    if ( empty( $to_write ) ) {
+        return [ 'ok' => false, 'error' => 'generation_failed', 'updated' => [], 'skipped' => [], 'failed' => $generation_failed ];
     }
 
-    if ( ! $image_already_current ) {
-        $image_blob = $github_api( 'POST', '/git/blobs', [
-                'content'  => base64_encode( $image_data ),
-                'encoding' => 'base64',
-        ] );
-        if ( ! $image_blob ) return false;
-
-        $tree_updates[] = [ 'path' => $new_image_path, 'mode' => '100644', 'type' => 'blob', 'sha' => $image_blob['sha'] ];
+    $batch = aps_github_start_batch();
+    if ( ! $batch ) {
+        return [ 'ok' => false, 'error' => 'not_configured_or_unreachable', 'updated' => [], 'skipped' => [], 'failed' => $generation_failed ];
     }
 
-    // 4. JSON — write the resolved backend URL under the given field name,
-    // and drop the raw attachment-ID field so it never leaks to the frontend.
-    unset( $page_data[ $image_url_field . '_id' ] );
-    $page_data[ $image_url_field ] = $backend_image_url;
-    $json_content = json_encode( $page_data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES );
-
-    $local_json_sha = sha1( "blob " . strlen( $json_content ) . "\0" . $json_content );
-    $json_changed   = ( $existing_json_sha !== $local_json_sha );
-
-    if ( $json_changed ) {
-        $json_blob = $github_api( 'POST', '/git/blobs', [
-                'content'  => base64_encode( $json_content ),
-                'encoding' => 'base64',
-        ] );
-        if ( ! $json_blob ) return false;
-
-        $tree_updates[] = [ 'path' => $json_path, 'mode' => '100644', 'type' => 'blob', 'sha' => $json_blob['sha'] ];
+    $path_to_label = [];
+    foreach ( $to_write as $label => $file ) {
+        $path_to_label[ $file['path'] ] = $label;
+        aps_github_batch_put_file( $batch, $file['path'], $file['content'] );
     }
 
-    if ( empty( $tree_updates ) ) {
-        return 'no_changes';
+    if ( ! empty( $batch['failed'] ) ) {
+        return [ 'ok' => false, 'error' => 'blob_upload_failed', 'updated' => [], 'skipped' => [], 'failed' => array_merge( $generation_failed, $batch['failed'] ) ];
     }
 
-    $new_tree = $github_api( 'POST', '/git/trees', [
-            'base_tree' => $base_tree_sha,
-            'tree'      => $tree_updates,
-    ] );
-    if ( ! $new_tree ) return false;
+    $result = aps_github_finish_batch( $batch, 'Update products, categories, and price meta from WP' );
 
-    $new_commit = $github_api( 'POST', '/git/commits', [
-            'message' => "Update {$image_url_field} and branding config",
-            'tree'    => $new_tree['sha'],
-            'parents' => [ $base_commit_sha ],
-    ] );
-    if ( ! $new_commit ) return false;
+    if ( $result === false ) {
+        return [ 'ok' => false, 'error' => 'commit_failed', 'updated' => [], 'skipped' => [], 'failed' => $generation_failed ];
+    }
 
-    $updated_ref = $github_api( 'PATCH', "/git/refs/heads/{$branch}", [
-            'sha'   => $new_commit['sha'],
-            'force' => false,
-    ] );
-    if ( ! $updated_ref ) return false;
+    $to_labels = function( $paths ) use ( $path_to_label ) {
+        return array_map( function( $p ) use ( $path_to_label ) { return $path_to_label[ $p ] ?? $p; }, $paths );
+    };
 
-    return true;
+    return [
+        'ok'         => true,
+        'updated'    => $to_labels( $batch['updated'] ),
+        'skipped'    => $to_labels( $batch['skipped'] ),
+        'failed'     => $generation_failed,
+        'no_changes' => ( $result === 'no_changes' ),
+    ];
 }
 
 function aps_sync_products_to_github() {
@@ -417,20 +322,15 @@ function aps_sync_products_to_github() {
         return 'json_failed';
     }
 
-    $new_hash = md5($json);
-    $old_hash = get_option('aps_products_json_hash');
-
-    if ($new_hash === $old_hash) {
-        return 'no_changes';
-    }
-
-    $result = aps_commit_to_github($json,'public/data/products.json', 'Update products from WP');
-
-    if ($result) {
-        update_option('aps_products_json_hash', $new_hash);
-    }
-
-    return $result;
+    // Note: no local hash short-circuit here. aps_commit_to_github() already
+    // fetches the current file from GitHub and compares normalized JSON
+    // against it, returning 'no_changes' when the remote is truly identical.
+    // A local WP-option hash check here would be repo-blind and can drift
+    // from reality (e.g. after switching GITHUB_REPO_OWNER/NAME, restoring
+    // a DB backup, or someone editing the file directly on GitHub), causing
+    // false "up to date" results. Let the remote comparison be the only
+    // source of truth.
+    return aps_commit_to_github($json, 'public/data/products.json', 'Update products from WP');
 }
 function aps_sync_categories_to_github() {
 
@@ -440,25 +340,13 @@ function aps_sync_categories_to_github() {
         return 'json failed';
     }
 
-    $new_hash = md5($json);
-
-    $old_hash = get_option('aps_categories_json_hash');
-
-    if ($new_hash === $old_hash) {
-        return 'no changes';
-    }
-
-    $result = aps_commit_to_github(
-            $json,
-            'public/data/categories.json',
-            'Update categories from WP'
+    // See note in aps_sync_products_to_github(): rely on aps_commit_to_github()'s
+    // remote-content comparison instead of a local, repo-blind hash cache.
+    return aps_commit_to_github(
+        $json,
+        'public/data/categories.json',
+        'Update categories from WP'
     );
-
-    if ($result) {
-        update_option('aps_categories_json_hash', $new_hash);
-    }
-
-    return $result;
 }
 
 function aps_generate_price_meta_json() {
@@ -466,10 +354,10 @@ function aps_generate_price_meta_json() {
     $url = site_url('/wp-json/qwoo/v1/products-meta?category=all');
 
     $response = wp_remote_get($url, [
-            'timeout' => 30,
-            'headers' => [
-                    'User-Agent' => 'WP-StoreAPI-Sync'
-            ]
+        'timeout' => 30,
+        'headers' => [
+            'User-Agent' => 'WP-StoreAPI-Sync'
+        ]
     ]);
 
     if (is_wp_error($response)) {
@@ -489,8 +377,8 @@ function aps_generate_price_meta_json() {
     }
 
     return json_encode(
-            $decoded,
-            JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
+        $decoded,
+        JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
     );
 }
 
@@ -502,25 +390,13 @@ function aps_sync_price_meta_to_github() {
         return 'json failed';
     }
 
-    $new_hash = md5($json);
-
-    $old_hash = get_option('aps_price_meta_hash');
-
-    if ($new_hash === $old_hash) {
-        return 'no changes';
-    }
-
-    $result = aps_commit_to_github(
-            $json,
-            'public/data/price-meta.json',
-            'Update price meta from WP'
+    // See note in aps_sync_products_to_github(): rely on aps_commit_to_github()'s
+    // remote-content comparison instead of a local, repo-blind hash cache.
+    return aps_commit_to_github(
+        $json,
+        'public/data/price-meta.json',
+        'Update price meta from WP'
     );
-
-    if ($result) {
-        update_option('aps_price_meta_hash', $new_hash);
-    }
-
-    return $result;
 }
 
 function aps_fetch_store_api($endpoint, $params = []) {
@@ -532,21 +408,21 @@ function aps_fetch_store_api($endpoint, $params = []) {
     do {
 
         $query_args = array_merge([
-                'page' => $page,
-                'per_page' => 100,
-                'include_sort_meta' => "false"
+            'page' => $page,
+            'per_page' => 100,
+            'include_sort_meta' => "false"
         ], $params);
 
         $url = add_query_arg(
-                $query_args,
-                site_url("/wp-json/wc/store/{$endpoint}")
+            $query_args,
+            site_url("/wp-json/wc/store/{$endpoint}")
         );
 
         $response = wp_remote_get($url, [
-                'timeout' => 30,
-                'headers' => [
-                        'User-Agent' => 'WP-StoreAPI-Sync'
-                ]
+            'timeout' => 30,
+            'headers' => [
+                'User-Agent' => 'WP-StoreAPI-Sync'
+            ]
         ]);
 
         if (is_wp_error($response)) {
@@ -568,11 +444,11 @@ function aps_fetch_store_api($endpoint, $params = []) {
         $all_items = array_merge($all_items, $decoded);
 
         $total_pages = max(
-                1,
-                (int)wp_remote_retrieve_header(
-                        $response,
-                        'x-wp-totalpages'
-                )
+            1,
+            (int)wp_remote_retrieve_header(
+                $response,
+                'x-wp-totalpages'
+            )
         );
 
         $page++;
@@ -580,8 +456,8 @@ function aps_fetch_store_api($endpoint, $params = []) {
     } while ($page <= $total_pages);
 
     return json_encode(
-            $all_items,
-            JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
+        $all_items,
+        JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
     );
 }
 
@@ -618,10 +494,10 @@ function aps_commit_to_github($content, $path = null, $message = 'Auto-sync from
 
     // 1. Get current file (if exists)
     $existing = wp_remote_get($api_url, [
-            'headers' => [
-                    'Authorization' => "token $token",
-                    'User-Agent'    => 'WordPress-GitHub-Client'
-            ]
+        'headers' => [
+            'Authorization' => "token $token",
+            'User-Agent'    => 'WordPress-GitHub-Client'
+        ]
     ]);
 
     $sha = null;
@@ -667,8 +543,8 @@ function aps_commit_to_github($content, $path = null, $message = 'Auto-sync from
 
     // 4. Prepare data
     $data = [
-            'message' => $message,
-            'content' => base64_encode($normalized_new),
+        'message' => $message,
+        'content' => base64_encode($normalized_new),
     ];
 
     if ($sha) {
@@ -677,13 +553,13 @@ function aps_commit_to_github($content, $path = null, $message = 'Auto-sync from
 
     // 5. Send request
     $response = wp_remote_request($api_url, [
-            'method'  => 'PUT',
-            'headers' => [
-                    'Authorization' => "token $token",
-                    'User-Agent'    => 'WordPress-GitHub-Client',
-                    'Content-Type'  => 'application/json'
-            ],
-            'body' => json_encode($data)
+        'method'  => 'PUT',
+        'headers' => [
+            'Authorization' => "token $token",
+            'User-Agent'    => 'WordPress-GitHub-Client',
+            'Content-Type'  => 'application/json'
+        ],
+        'body' => json_encode($data)
     ]);
 
     if (is_wp_error($response)) {

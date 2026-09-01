@@ -688,12 +688,31 @@ class Shop_Settings_Builder {
                 'pwa' => 'PWA Settings',
         ];
 
-        $success_count = 0;
-        $skipped_count = 0;
-        $failed_count  = 0;
-        $updated_labels = [];
-        $skipped_labels = [];
-        $failed_labels  = [];
+        $has_any_page_data = false;
+        foreach ($allowed_pages as $page_slug) {
+            if (isset($options[$page_slug])) {
+                $has_any_page_data = true;
+                break;
+            }
+        }
+
+        if (!$has_any_page_data) {
+            // No page in $allowed_pages had any saved data at all.
+            wp_send_json_error('Nothing to push yet — click Save Draft first, then try again.');
+        }
+
+        $batch = aps_github_start_batch();
+
+        if (!$batch) {
+            wp_send_json_error(
+                    'Failed to push to GitHub: could not reach the repository. '
+                    . 'Double-check the GitHub Owner/Repo/Token in Technical Settings.'
+            );
+        }
+
+        // Maps a staged path back to the human label it belongs to, so the
+        // single combined batch result can still be reported per-page.
+        $path_to_label = [];
 
         foreach ($allowed_pages as $page_slug) {
             if (!isset($options[$page_slug])) continue;
@@ -701,120 +720,119 @@ class Shop_Settings_Builder {
             $page_data = $options[$page_slug];
             $path = "public/config/{$page_slug}.json";
             $label = $page_labels[$page_slug] ?? ucfirst($page_slug);
+            $path_to_label[$path] = $label;
 
             if ($page_slug === 'home' && !empty($page_data['hero_image_id'])) {
-                $home_data = $page_data;
-                unset($home_data['hero_image_id']);
+                $attachment_id = $page_data['hero_image_id'];
+                unset($page_data['hero_image_id']);
 
-                $result = aps_sync_hero_image_to_github($page_data['hero_image_id'], $home_data, 'public/homepage-hero', $path);
+                $attachment_path = get_attached_file($attachment_id);
 
-                if ($result === true) {
-                    $success_count++;
-                    $updated_labels[] = "{$label} (hero image)";
-                    continue;
-                } elseif ($result === 'no_changes') {
-                    $skipped_count++;
-                    $skipped_labels[] = $label;
-                    continue;
+                if ($attachment_path && file_exists($attachment_path)) {
+                    $image_folder = 'public/homepage-hero';
+                    $filename = sanitize_file_name(basename($attachment_path));
+                    $image_path = "{$image_folder}/{$filename}";
+                    $image_data = file_get_contents($attachment_path);
+
+                    if ($image_data !== false) {
+                        // Scoped to the whole folder: it only ever holds one
+                        // hero image, so anything else in there is stale.
+                        aps_github_batch_delete_stale_prefix($batch, $image_folder . '/', $image_path);
+                        aps_github_batch_put_file($batch, $image_path, $image_data);
+                        $path_to_label[$image_path] = "{$label} (hero image)";
+
+                        $page_data['hero_image'] = wp_get_attachment_url($attachment_id);
+                    } else {
+                        error_log('Qwoo: could not read hero image file, pushing home.json without it.');
+                    }
                 } else {
-                    error_log('Qwoo: hero image sync failed, falling back to json-only push for home.');
-                    // fall through to the plain json-only push below, which
-                    // will record its own success/skipped/failed outcome
+                    error_log('Qwoo: hero image attachment missing on disk, pushing home.json without it.');
                 }
             }
 
             if ($page_slug === 'branding') {
-                $branding_data = $page_data;
-                $image_sync_failed = false;
-                $synced_fields = []; // e.g. ['logo', 'app_icon']
-
                 $image_fields = ['logo_id' => 'logo', 'app_icon_id' => 'app_icon'];
 
-                $attachment_ids = [];
                 foreach ($image_fields as $id_field => $url_field) {
-                    if (empty($branding_data[$id_field])) continue;
-                    $attachment_ids[$id_field] = $branding_data[$id_field];
-                    $branding_data[$url_field] = wp_get_attachment_url($branding_data[$id_field]);
-                    unset($branding_data[$id_field]);
-                }
+                    if (empty($page_data[$id_field])) continue;
 
-                foreach ($image_fields as $id_field => $url_field) {
-                    if (empty($attachment_ids[$id_field])) continue;
+                    $attachment_id = $page_data[$id_field];
+                    unset($page_data[$id_field]);
 
-                    $result = aps_sync_logo_to_github(
-                            $attachment_ids[$id_field],
-                            $branding_data,
-                            $url_field,
-                            'public/branding',
-                            $path
-                    );
-
-                    if ($result === true) {
-                        $synced_fields[] = $url_field === 'app_icon' ? 'app icon' : $url_field;
-                    } elseif ($result === 'no_changes') {
-                        // no-op, another field or the json itself may still change
-                    } else {
-                        $image_sync_failed = true;
-                        error_log("Qwoo: branding image sync failed for {$id_field}, falling back to json-only push for branding.");
+                    $attachment_path = get_attached_file($attachment_id);
+                    if (!$attachment_path || !file_exists($attachment_path)) {
+                        error_log("Qwoo: {$id_field} attachment missing on disk, skipping.");
+                        continue;
                     }
-                }
 
-                if (!empty($synced_fields) && !$image_sync_failed) {
-                    $success_count++;
-                    $updated_labels[] = "{$label} (" . implode(', ', $synced_fields) . ")";
-                    continue;
-                } elseif (!$image_sync_failed && empty($synced_fields)) {
-                    $skipped_count++;
-                    $skipped_labels[] = $label;
-                    continue;
+                    $image_folder = 'public/branding';
+                    $filename = sanitize_file_name(basename($attachment_path));
+                    $image_path = "{$image_folder}/{$filename}";
+                    $image_data = file_get_contents($attachment_path);
+
+                    if ($image_data === false) {
+                        error_log("Qwoo: could not read {$id_field} file, skipping.");
+                        continue;
+                    }
+
+                    // Scoped to this exact target path, NOT the whole folder —
+                    // logo and app icon share 'public/branding', so cleaning
+                    // up one must never delete the other.
+                    aps_github_batch_delete_stale_prefix($batch, $image_path, $image_path);
+                    aps_github_batch_put_file($batch, $image_path, $image_data);
+
+                    $field_label = $url_field === 'app_icon' ? 'app icon' : $url_field;
+                    $path_to_label[$image_path] = "{$label} ({$field_label})";
+
+                    $page_data[$url_field] = wp_get_attachment_url($attachment_id);
                 }
-                // fall through to plain json-only push below if an image sync failed
             }
 
-            $content = json_encode($page_data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-            $result = aps_commit_to_github($content, $path, "Update shop config for: {$page_slug}");
-
-            if ($result === true) {
-                $success_count++;
-                $updated_labels[] = $label;
-            } elseif ($result === 'no_changes') {
-                $skipped_count++;
-                $skipped_labels[] = $label;
-            } else {
-                // $result is false, 'not_configured', or 'missing_path' —
-                // all real failures that were previously dropped silently,
-                // leaving success_count/skipped_count at 0 with no clue why.
-                $failed_count++;
-                $reason = $result === 'not_configured'
-                        ? 'GitHub owner/repo/token not configured'
-                        : 'request to GitHub failed — check the PHP error log';
-                $failed_labels[] = "{$label} ({$reason})";
-            }
+            $content = aps_normalize_json(json_encode($page_data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+            aps_github_batch_put_file($batch, $path, $content);
         }
 
-        if ($success_count > 0 || $skipped_count > 0) {
-            $summary = "Updated: {$success_count}, Skipped (no changes): {$skipped_count}";
-            if ($failed_count > 0) {
-                $summary .= ", Failed: {$failed_count}";
-            }
-            wp_send_json_success([
-                    'summary' => $summary,
-                    'updated_labels' => $updated_labels,
-                    'skipped_labels' => $skipped_labels,
-                    'failed_labels' => $failed_labels,
-            ]);
-        } elseif ($failed_count > 0) {
-            // Every page that had data failed to push — almost always a
-            // GitHub config problem (wrong owner/repo, bad/expired token,
-            // token lacks repo access) rather than "nothing to sync".
+        if (!empty($batch['failed'])) {
             wp_send_json_error(
-                    'Failed to push to GitHub: ' . implode('; ', $failed_labels)
-                    . '. Double-check the GitHub Owner/Repo/Token in Technical Settings.'
+                    'Failed to push to GitHub: could not upload ' . implode(', ', $batch['failed'])
+                    . '. Check the PHP error log for details.'
             );
-        } else {
-            // No page in $allowed_pages had any saved data at all.
-            wp_send_json_error('Nothing to push yet — click Save Draft first, then try again.');
         }
+
+        $result = aps_github_finish_batch($batch, 'Update shop config from WP');
+
+        if ($result === false) {
+            wp_send_json_error(
+                    'Failed to push to GitHub — the commit could not be created. '
+                    . 'Check the PHP error log for details.'
+            );
+        }
+
+        $to_labels = function ($paths) use ($path_to_label) {
+            $labels = array_map(function ($p) use ($path_to_label) {
+                return $path_to_label[$p] ?? $p;
+            }, $paths);
+            return array_values(array_unique($labels));
+        };
+
+        $updated_labels = $result === 'no_changes' ? [] : $to_labels($batch['updated']);
+        $skipped_labels = $to_labels(array_merge($batch['skipped'], $result === 'no_changes' ? $batch['updated'] : []));
+
+        if ($result === 'no_changes' || (empty($updated_labels) && empty($skipped_labels))) {
+            wp_send_json_success([
+                    'summary' => 'Nothing changed — everything already up to date on GitHub.',
+                    'updated_labels' => [],
+                    'skipped_labels' => $skipped_labels,
+                    'failed_labels' => [],
+            ]);
+        }
+
+        wp_send_json_success([
+                'summary' => 'Updated: ' . count($updated_labels) . ', Skipped (no changes): ' . count($skipped_labels),
+                'updated_labels' => $updated_labels,
+                'skipped_labels' => $skipped_labels,
+                'failed_labels' => [],
+        ]);
     }
 
     /* -------------------------
@@ -1278,49 +1296,49 @@ class Shop_Settings_Builder {
                                     $c_icon    = $method['icon'] ?? '';
                                     $c_enabled = ! empty( $method['enabled'] );
                                     ?>
-                                <div class="qwoo-contact-method-row">
-                                    <div class="qwoo-contact-method-row__top">
-                                        <select class="qwoo-contact-type" name="shop_builder_options[contact][methods][<?php echo esc_attr( $i ); ?>][type]">
-                                            <option value="whatsapp" <?php selected( $c_type, 'whatsapp' ); ?>>WhatsApp</option>
-                                            <option value="phone" <?php selected( $c_type, 'phone' ); ?>>Phone call</option>
-                                            <option value="email" <?php selected( $c_type, 'email' ); ?>>Email</option>
-                                            <option value="telegram" <?php selected( $c_type, 'telegram' ); ?>>Telegram</option>
-                                            <option value="custom" <?php selected( $c_type, 'custom' ); ?>>Custom</option>
-                                        </select>
+                                    <div class="qwoo-contact-method-row">
+                                        <div class="qwoo-contact-method-row__top">
+                                            <select class="qwoo-contact-type" name="shop_builder_options[contact][methods][<?php echo esc_attr( $i ); ?>][type]">
+                                                <option value="whatsapp" <?php selected( $c_type, 'whatsapp' ); ?>>WhatsApp</option>
+                                                <option value="phone" <?php selected( $c_type, 'phone' ); ?>>Phone call</option>
+                                                <option value="email" <?php selected( $c_type, 'email' ); ?>>Email</option>
+                                                <option value="telegram" <?php selected( $c_type, 'telegram' ); ?>>Telegram</option>
+                                                <option value="custom" <?php selected( $c_type, 'custom' ); ?>>Custom</option>
+                                            </select>
 
-                                        <label class="qwoo-contact-enabled-label">
-                                            <input type="checkbox" name="shop_builder_options[contact][methods][<?php echo esc_attr( $i ); ?>][enabled]" value="1" <?php checked( $c_enabled ); ?> />
-                                            Enabled
-                                        </label>
+                                            <label class="qwoo-contact-enabled-label">
+                                                <input type="checkbox" name="shop_builder_options[contact][methods][<?php echo esc_attr( $i ); ?>][enabled]" value="1" <?php checked( $c_enabled ); ?> />
+                                                Enabled
+                                            </label>
 
-                                        <button type="button" class="button button-link-delete qwoo-remove-contact-method">Remove</button>
-                                    </div>
+                                            <button type="button" class="button button-link-delete qwoo-remove-contact-method">Remove</button>
+                                        </div>
 
-                                    <input
-                                        type="text"
-                                        class="large-text qwoo-contact-value"
-                                        name="shop_builder_options[contact][methods][<?php echo esc_attr( $i ); ?>][value]"
-                                        value="<?php echo esc_attr( $c_value ); ?>"
-                                        placeholder="<?php echo esc_attr( Shop_Settings_Builder::contact_placeholder( $c_type ) ); ?>"
-                                    />
-
-                                    <div class="qwoo-contact-custom-fields <?php echo $c_type === 'custom' ? '' : 'qwoo-hidden'; ?>">
                                         <input
-                                            type="text"
-                                            class="large-text"
-                                            name="shop_builder_options[contact][methods][<?php echo esc_attr( $i ); ?>][label]"
-                                            value="<?php echo esc_attr( $c_label ); ?>"
-                                            placeholder="Label (e.g. Live Chat)"
+                                                type="text"
+                                                class="large-text qwoo-contact-value"
+                                                name="shop_builder_options[contact][methods][<?php echo esc_attr( $i ); ?>][value]"
+                                                value="<?php echo esc_attr( $c_value ); ?>"
+                                                placeholder="<?php echo esc_attr( Shop_Settings_Builder::contact_placeholder( $c_type ) ); ?>"
                                         />
-                                        <input
-                                            type="url"
-                                            class="large-text"
-                                            name="shop_builder_options[contact][methods][<?php echo esc_attr( $i ); ?>][icon]"
-                                            value="<?php echo esc_attr( $c_icon ); ?>"
-                                            placeholder="Icon image URL"
-                                        />
+
+                                        <div class="qwoo-contact-custom-fields <?php echo $c_type === 'custom' ? '' : 'qwoo-hidden'; ?>">
+                                            <input
+                                                    type="text"
+                                                    class="large-text"
+                                                    name="shop_builder_options[contact][methods][<?php echo esc_attr( $i ); ?>][label]"
+                                                    value="<?php echo esc_attr( $c_label ); ?>"
+                                                    placeholder="Label (e.g. Live Chat)"
+                                            />
+                                            <input
+                                                    type="url"
+                                                    class="large-text"
+                                                    name="shop_builder_options[contact][methods][<?php echo esc_attr( $i ); ?>][icon]"
+                                                    value="<?php echo esc_attr( $c_icon ); ?>"
+                                                    placeholder="Icon image URL"
+                                            />
+                                        </div>
                                     </div>
-                                </div>
                                 <?php endforeach; ?>
                             </div>
 
@@ -1359,7 +1377,7 @@ class Shop_Settings_Builder {
                         <div class="preview-url-row">
                             <code id="preview-url-display"><?php
                                 echo esc_html( $preview_urls['tab-header'] ?: 'Set a Frontend Domain in Technical Settings first.' );
-                            ?></code>
+                                ?></code>
                             <a id="preview-url-link"
                                href="<?php echo esc_url( $preview_urls['tab-header'] ?: '#' ); ?>"
                                target="_blank"

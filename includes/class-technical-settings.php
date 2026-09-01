@@ -307,10 +307,10 @@ class Qwoo_Technical_Settings {
         if ( ! current_user_can( 'manage_options' ) ) return;
 
         echo '<div class="notice notice-error"><p><strong>Q-Woo:</strong> '
-            . 'WordPress\'s <code>AUTH_KEY</code> is missing or still set to its default placeholder in <code>wp-config.php</code>. '
-            . 'Until this is fixed with a real, unique value, Q-Woo cannot securely store or read your API keys (GitHub token, Google OAuth, VAPID keys) — they will appear unset. '
-            . 'Generate a fresh set of unique keys at <a href="https://api.wordpress.org/secret-key/1.1/salt/" target="_blank" rel="noopener">api.wordpress.org/secret-key/1.1/salt/</a> and replace the corresponding block in <code>wp-config.php</code>.'
-            . '</p></div>';
+                . 'WordPress\'s <code>AUTH_KEY</code> is missing or still set to its default placeholder in <code>wp-config.php</code>. '
+                . 'Until this is fixed with a real, unique value, Q-Woo cannot securely store or read your API keys (GitHub token, Google OAuth, VAPID keys) — they will appear unset. '
+                . 'Generate a fresh set of unique keys at <a href="https://api.wordpress.org/secret-key/1.1/salt/" target="_blank" rel="noopener">api.wordpress.org/secret-key/1.1/salt/</a> and replace the corresponding block in <code>wp-config.php</code>.'
+                . '</p></div>';
     }
 
     /* ─────────────────────────────────────────
@@ -566,8 +566,8 @@ class Qwoo_Technical_Settings {
         // Only the public key is ever sent back to the browser — the
         // private key is encrypted at rest and never leaves the server.
         wp_send_json_success( [
-            'publicKey' => $keys['publicKey'],
-            'message'   => 'New VAPID keys generated and saved.',
+                'publicKey' => $keys['publicKey'],
+                'message'   => 'New VAPID keys generated and saved.',
         ] );
     }
 
@@ -601,37 +601,35 @@ class Qwoo_Technical_Settings {
             wp_send_json_error( 'Unauthorized' );
         }
 
-        $jobs = [
-                'products'   => 'aps_sync_products_to_github',
-                'categories' => 'aps_sync_categories_to_github',
-                'price-meta' => 'aps_sync_price_meta_to_github',
-        ];
+        if ( ! function_exists( 'aps_sync_all_data_to_github' ) ) {
+            wp_send_json_error( [ 'results' => [
+                    'products'   => 'unavailable',
+                    'categories' => 'unavailable',
+                    'price-meta' => 'unavailable',
+            ] ] );
+        }
+
+        // Regenerates products/categories/price-meta and pushes any that
+        // changed to GitHub in a SINGLE commit, instead of one commit per file.
+        $sync = aps_sync_all_data_to_github();
 
         $results = [];
-        $had_error = false;
-
-        foreach ( $jobs as $label => $fn ) {
-            if ( ! function_exists( $fn ) ) {
-                $results[ $label ] = 'unavailable';
-                $had_error = true;
-                continue;
-            }
-
-            $result = call_user_func( $fn );
-
-            if ( $result === 'no_changes' || $result === 'no changes' ) {
-                $results[ $label ] = 'up to date';
-            } elseif ( $result ) {
-                $results[ $label ] = 'synced';
-            } else {
+        foreach ( array_keys( [ 'products' => 1, 'categories' => 1, 'price-meta' => 1 ] ) as $label ) {
+            if ( in_array( $label, $sync['failed'], true ) ) {
                 $results[ $label ] = 'failed';
-                $had_error = true;
+            } elseif ( in_array( $label, $sync['updated'], true ) ) {
+                $results[ $label ] = 'synced';
+            } elseif ( in_array( $label, $sync['skipped'], true ) ) {
+                $results[ $label ] = 'up to date';
+            } else {
+                // Shouldn't normally happen, but keep the response shape stable.
+                $results[ $label ] = $sync['ok'] ? 'up to date' : 'failed';
             }
         }
 
         $response = [ 'results' => $results ];
 
-        if ( $had_error ) {
+        if ( ! $sync['ok'] || ! empty( $sync['failed'] ) ) {
             wp_send_json_error( $response );
         }
 
@@ -778,12 +776,12 @@ class Qwoo_Technical_Settings {
                     <div class="qwoo-field">
                         <label for="frontend_domain">Frontend Domain</label>
                         <input
-                            type="url"
-                            id="frontend_domain"
-                            name="qwoo_technical[frontend_domain]"
-                            value="<?php echo esc_attr( $settings['frontend_domain'] ?? '' ); ?>"
-                            placeholder="https://your-app.com"
-                            class="qwoo-input"
+                                type="url"
+                                id="frontend_domain"
+                                name="qwoo_technical[frontend_domain]"
+                                value="<?php echo esc_attr( $settings['frontend_domain'] ?? '' ); ?>"
+                                placeholder="https://your-app.com"
+                                class="qwoo-input"
                         />
                         <span class="qwoo-hint">The URL of your headless frontend app (no trailing slash). Added to the allowed CORS origins.</span>
                     </div>
@@ -791,11 +789,11 @@ class Qwoo_Technical_Settings {
                     <div class="qwoo-field">
                         <label class="qwoo-toggle-label">
                             <input
-                                type="checkbox"
-                                id="localhost_enabled"
-                                name="qwoo_technical[localhost_enabled]"
-                                value="1"
-                                <?php checked( ! empty( $settings['localhost_enabled'] ) ); ?>
+                                    type="checkbox"
+                                    id="localhost_enabled"
+                                    name="qwoo_technical[localhost_enabled]"
+                                    value="1"
+                                    <?php checked( ! empty( $settings['localhost_enabled'] ) ); ?>
                             />
                             <span class="qwoo-toggle"></span>
                             Allow localhost (development environment)
@@ -805,14 +803,14 @@ class Qwoo_Technical_Settings {
                     <div class="qwoo-field qwoo-localhost-port <?php echo empty( $settings['localhost_enabled'] ) ? 'qwoo-hidden' : ''; ?>">
                         <label for="localhost_port">Localhost Port</label>
                         <input
-                            type="number"
-                            id="localhost_port"
-                            name="qwoo_technical[localhost_port]"
-                            value="<?php echo esc_attr( $settings['localhost_port'] ?? 9000 ); ?>"
-                            min="1"
-                            max="65535"
-                            class="qwoo-input qwoo-input--short"
-                            placeholder="9000"
+                                type="number"
+                                id="localhost_port"
+                                name="qwoo_technical[localhost_port]"
+                                value="<?php echo esc_attr( $settings['localhost_port'] ?? 9000 ); ?>"
+                                min="1"
+                                max="65535"
+                                class="qwoo-input qwoo-input--short"
+                                placeholder="9000"
                         />
                         <span class="qwoo-hint">e.g. 9000 → allows <code>https://localhost:9000</code></span>
                     </div>
@@ -930,11 +928,11 @@ class Qwoo_Technical_Settings {
                         <label>Cron URL</label>
                         <div class="qwoo-masked-row">
                             <input
-                                type="text"
-                                class="qwoo-input"
-                                value="<?php echo esc_url( qwoo_get_cron_url() ); ?>"
-                                readonly
-                                onclick="this.select();"
+                                    type="text"
+                                    class="qwoo-input"
+                                    value="<?php echo esc_url( qwoo_get_cron_url() ); ?>"
+                                    readonly
+                                    onclick="this.select();"
                             />
                         </div>
                         <span class="qwoo-hint">Typical host setup: run this URL via <code>curl</code> or <code>wget</code> every 15–60 minutes. Requests without the correct key are rejected automatically.</span>
@@ -957,130 +955,130 @@ class Qwoo_Technical_Settings {
 
                 <!-- ── API Keys ── -->
                 <?php foreach ( self::$api_key_fields as $group_key => $group ) : ?>
-                <div class="qwoo-card">
-                    <div class="qwoo-card__head">
+                    <div class="qwoo-card">
+                        <div class="qwoo-card__head">
                         <span class="qwoo-card__icon">
                             <?php echo $group_key === 'vapid' ? '🔔' : ( $group_key === 'github' ? '🐙' : '🔑' ); ?>
                         </span>
-                        <div>
-                            <h2><?php echo esc_html( $group['label'] ); ?></h2>
-                            <p>Keys are encrypted before storage using your WordPress secret key.</p>
+                            <div>
+                                <h2><?php echo esc_html( $group['label'] ); ?></h2>
+                                <p>Keys are encrypted before storage using your WordPress secret key.</p>
+                            </div>
                         </div>
-                    </div>
 
-                    <?php if ( $group_key === 'vapid' ) :
-                        $vapid_locked  = defined( 'VAPID_API_PUBLIC_KEY' ) || defined( 'VAPID_API_PRIVATE_KEY' );
-                        $vapid_is_set  = ! empty( $stored_keys['VAPID_API_PUBLIC_KEY'] ) || defined( 'VAPID_API_PUBLIC_KEY' );
-                    ?>
-                    <div class="qwoo-field">
-                        <label for="push_email">Notification Sender Email</label>
-                        <input
-                            type="email"
-                            id="push_email"
-                            name="qwoo_technical[push_email]"
-                            value="<?php echo esc_attr( $settings['push_email'] ?? get_option( 'admin_email' ) ); ?>"
-                            placeholder="your@email.com"
-                            class="qwoo-input"
-                        />
-                        <span class="qwoo-hint">Used as the VAPID <code>subject</code> — identifies who is sending push notifications. Defaults to your WordPress admin email.</span>
-                    </div>
+                        <?php if ( $group_key === 'vapid' ) :
+                            $vapid_locked  = defined( 'VAPID_API_PUBLIC_KEY' ) || defined( 'VAPID_API_PRIVATE_KEY' );
+                            $vapid_is_set  = ! empty( $stored_keys['VAPID_API_PUBLIC_KEY'] ) || defined( 'VAPID_API_PUBLIC_KEY' );
+                            ?>
+                            <div class="qwoo-field">
+                                <label for="push_email">Notification Sender Email</label>
+                                <input
+                                        type="email"
+                                        id="push_email"
+                                        name="qwoo_technical[push_email]"
+                                        value="<?php echo esc_attr( $settings['push_email'] ?? get_option( 'admin_email' ) ); ?>"
+                                        placeholder="your@email.com"
+                                        class="qwoo-input"
+                                />
+                                <span class="qwoo-hint">Used as the VAPID <code>subject</code> — identifies who is sending push notifications. Defaults to your WordPress admin email.</span>
+                            </div>
 
-                    <?php if ( ! $vapid_locked ) : ?>
-                    <div class="qwoo-field">
-                        <button type="button" id="qwoo-generate-vapid" class="qwoo-btn qwoo-btn--secondary">
-                            <span class="qwoo-btn__text">⚡ Generate VAPID Keys</span>
-                            <span class="qwoo-btn__loader" style="display:none;">Generating…</span>
-                        </button>
-                        <span class="qwoo-hint">
+                            <?php if ( ! $vapid_locked ) : ?>
+                            <div class="qwoo-field">
+                                <button type="button" id="qwoo-generate-vapid" class="qwoo-btn qwoo-btn--secondary">
+                                    <span class="qwoo-btn__text">⚡ Generate VAPID Keys</span>
+                                    <span class="qwoo-btn__loader" style="display:none;">Generating…</span>
+                                </button>
+                                <span class="qwoo-hint">
                             Creates a valid public/private key pair automatically — no external tools needed.
                             <?php echo $vapid_is_set ? ' Generating new keys will replace the existing pair, and any devices already subscribed for web push will need to re-subscribe.' : ''; ?>
                         </span>
-                    </div>
-                    <?php endif; ?>
-                    <?php endif; ?>
-
-                    <?php foreach ( $group['fields'] as $const_name => $field_label ) :
-                        $is_set = ! empty( $stored_keys[ $const_name ] ) || defined( $const_name );
-                        $from_config = defined( $const_name );
-                    ?>
-                    <div class="qwoo-field qwoo-key-field" data-key="<?php echo esc_attr( $const_name ); ?>">
-                        <label><?php echo esc_html( $field_label ); ?>
-                            <?php if ( $from_config ) : ?>
-                                <span class="qwoo-badge qwoo-badge--config">wp-config.php</span>
-                            <?php elseif ( $is_set ) : ?>
-                                <span class="qwoo-badge qwoo-badge--set">Saved</span>
-                            <?php else : ?>
-                                <span class="qwoo-badge qwoo-badge--unset">Not set</span>
-                            <?php endif; ?>
-                        </label>
-
-                        <?php if ( $from_config ) : ?>
-                            <div class="qwoo-config-note">
-                                Defined in <code>wp-config.php</code> — plugin will use that value automatically.
                             </div>
-                        <?php elseif ( $const_name === 'VAPID_API_PUBLIC_KEY' && $is_set ) : ?>
-                            <div class="qwoo-masked-row">
-                                <input
-                                    type="text"
-                                    id="qwoo-vapid-public-key"
-                                    class="qwoo-input qwoo-input--pubkey"
-                                    value="<?php echo esc_attr( self::get_key( $const_name ) ); ?>"
-                                    readonly
-                                    onclick="this.select();"
-                                />
-                                <button
-                                    type="button"
-                                    class="qwoo-btn qwoo-btn--ghost qwoo-copy-key"
-                                    data-copy-target="qwoo-vapid-public-key"
-                                >Copy</button>
-                            </div>
-                            <span class="qwoo-hint">Public — safe to paste into your frontend app's push-subscription code.</span>
-                        <?php elseif ( $is_set ) : ?>
-                            <div class="qwoo-masked-row">
-                                <input type="text" class="qwoo-input qwoo-input--masked" value="••••••••••••••••" readonly />
-                                <button
-                                    type="button"
-                                    class="qwoo-btn qwoo-btn--ghost qwoo-reset-key"
-                                    data-key="<?php echo esc_attr( $const_name ); ?>"
-                                >Reset</button>
-                            </div>
-                        <?php else : ?>
-                            <input
-                                type="text"
-                                name="qwoo_api_keys[<?php echo esc_attr( $const_name ); ?>]"
-                                class="qwoo-input qwoo-input--key"
-                                placeholder="Enter <?php echo esc_attr( $field_label ); ?>"
-                                autocomplete="off"
-                            />
                         <?php endif; ?>
-                    </div>
-                    <?php endforeach; ?>
+                        <?php endif; ?>
 
-                    <?php if ( $group_key === 'github' ) :
-                        $github_configured = ( ! empty( $stored_keys['GITHUB_REPO_OWNER'] ) || defined( 'GITHUB_REPO_OWNER' ) )
-                                && ( ! empty( $stored_keys['GITHUB_REPO_NAME'] ) || defined( 'GITHUB_REPO_NAME' ) )
-                                && ( ! empty( $stored_keys['GITHUB_TOKEN'] ) || defined( 'GITHUB_TOKEN' ) );
-                    ?>
-                    <div class="qwoo-field">
-                        <button
-                            type="button"
-                            id="qwoo-sync-data"
-                            class="qwoo-btn qwoo-btn--secondary"
-                            <?php disabled( ! $github_configured ); ?>
-                        >
-                            <span class="qwoo-btn__text">🔄 Sync Data Now</span>
-                            <span class="qwoo-btn__loader" style="display:none;">Syncing…</span>
-                        </button>
-                        <span class="qwoo-hint" id="qwoo-sync-data-hint">
+                        <?php foreach ( $group['fields'] as $const_name => $field_label ) :
+                            $is_set = ! empty( $stored_keys[ $const_name ] ) || defined( $const_name );
+                            $from_config = defined( $const_name );
+                            ?>
+                            <div class="qwoo-field qwoo-key-field" data-key="<?php echo esc_attr( $const_name ); ?>">
+                                <label><?php echo esc_html( $field_label ); ?>
+                                    <?php if ( $from_config ) : ?>
+                                        <span class="qwoo-badge qwoo-badge--config">wp-config.php</span>
+                                    <?php elseif ( $is_set ) : ?>
+                                        <span class="qwoo-badge qwoo-badge--set">Saved</span>
+                                    <?php else : ?>
+                                        <span class="qwoo-badge qwoo-badge--unset">Not set</span>
+                                    <?php endif; ?>
+                                </label>
+
+                                <?php if ( $from_config ) : ?>
+                                    <div class="qwoo-config-note">
+                                        Defined in <code>wp-config.php</code> — plugin will use that value automatically.
+                                    </div>
+                                <?php elseif ( $const_name === 'VAPID_API_PUBLIC_KEY' && $is_set ) : ?>
+                                    <div class="qwoo-masked-row">
+                                        <input
+                                                type="text"
+                                                id="qwoo-vapid-public-key"
+                                                class="qwoo-input qwoo-input--pubkey"
+                                                value="<?php echo esc_attr( self::get_key( $const_name ) ); ?>"
+                                                readonly
+                                                onclick="this.select();"
+                                        />
+                                        <button
+                                                type="button"
+                                                class="qwoo-btn qwoo-btn--ghost qwoo-copy-key"
+                                                data-copy-target="qwoo-vapid-public-key"
+                                        >Copy</button>
+                                    </div>
+                                    <span class="qwoo-hint">Public — safe to paste into your frontend app's push-subscription code.</span>
+                                <?php elseif ( $is_set ) : ?>
+                                    <div class="qwoo-masked-row">
+                                        <input type="text" class="qwoo-input qwoo-input--masked" value="••••••••••••••••" readonly />
+                                        <button
+                                                type="button"
+                                                class="qwoo-btn qwoo-btn--ghost qwoo-reset-key"
+                                                data-key="<?php echo esc_attr( $const_name ); ?>"
+                                        >Reset</button>
+                                    </div>
+                                <?php else : ?>
+                                    <input
+                                            type="text"
+                                            name="qwoo_api_keys[<?php echo esc_attr( $const_name ); ?>]"
+                                            class="qwoo-input qwoo-input--key"
+                                            placeholder="Enter <?php echo esc_attr( $field_label ); ?>"
+                                            autocomplete="off"
+                                    />
+                                <?php endif; ?>
+                            </div>
+                        <?php endforeach; ?>
+
+                        <?php if ( $group_key === 'github' ) :
+                            $github_configured = ( ! empty( $stored_keys['GITHUB_REPO_OWNER'] ) || defined( 'GITHUB_REPO_OWNER' ) )
+                                    && ( ! empty( $stored_keys['GITHUB_REPO_NAME'] ) || defined( 'GITHUB_REPO_NAME' ) )
+                                    && ( ! empty( $stored_keys['GITHUB_TOKEN'] ) || defined( 'GITHUB_TOKEN' ) );
+                            ?>
+                            <div class="qwoo-field">
+                                <button
+                                        type="button"
+                                        id="qwoo-sync-data"
+                                        class="qwoo-btn qwoo-btn--secondary"
+                                        <?php disabled( ! $github_configured ); ?>
+                                >
+                                    <span class="qwoo-btn__text">🔄 Sync Data Now</span>
+                                    <span class="qwoo-btn__loader" style="display:none;">Syncing…</span>
+                                </button>
+                                <span class="qwoo-hint" id="qwoo-sync-data-hint">
                             <?php if ( $github_configured ) : ?>
                                 Pushes fresh <code>products.json</code>, <code>categories.json</code>, and <code>price-meta.json</code> to your frontend repo right now — useful after bulk category or price changes, which don't sync automatically.
                             <?php else : ?>
                                 Set your Repository Owner, Repository Name, and GitHub Token above first.
                             <?php endif; ?>
                         </span>
+                            </div>
+                        <?php endif; ?>
                     </div>
-                    <?php endif; ?>
-                </div>
                 <?php endforeach; ?>
 
 
