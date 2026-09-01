@@ -2,7 +2,7 @@
 /**
  * Plugin Name: QWoo Core
  * Description: Headless WooCommerce backend for QWoo
- * Version:     1.0.1
+ * Version:     1.0.2
  * Author:      Meidan Mor
  * Plugin URI:  https://github.com/Meidanmor/qwoo-core
  * Requires Plugins: woocommerce
@@ -43,7 +43,7 @@ function qwoo_core_check_requirements() {
 
 define( 'QWOO_PATH',            plugin_dir_path( __FILE__ ) );
 define( 'QWOO_URL',             plugin_dir_url( __FILE__ ) );
-define( 'QWOO_VERSION',         '1.0.1' );
+define( 'QWOO_VERSION',         '1.0.2' );
 define( 'QWOO_FIREBASE_SA_PATH', WP_CONTENT_DIR . '/private/firebase-service-account.json' );
 
 /**
